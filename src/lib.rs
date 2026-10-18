@@ -16,8 +16,10 @@
 //! Qubits and rows are 0-indexed throughout (the paper is 1-indexed).
 
 pub mod canonical;
+pub mod ch_form;
 pub mod chp;
 pub mod circuit;
+mod columns;
 pub mod counting;
 pub mod error;
 pub mod experiment;
@@ -36,6 +38,7 @@ pub mod tableau;
 #[cfg(feature = "python")]
 mod python;
 
+pub use ch_form::ChForm;
 pub use circuit::{Circuit, Gate};
 pub use error::{Error, Result};
 pub use pauli::{g, PauliString};

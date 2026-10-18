@@ -11,6 +11,7 @@ dependencies = ["numpy"]
 
 [project.optional-dependencies]
 test = ["pytest"]
+benchmark = ["stim>=1.15,<2"]
 
 [tool.maturin]
 python-source = "python"

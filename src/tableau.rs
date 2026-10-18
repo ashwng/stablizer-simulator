@@ -8,14 +8,20 @@
 //! commute, and destabilizer i anticommutes with stabilizer i and commutes
 //! with every other stabilizer. Gates take O(n) time; both kinds of
 //! measurement take O(n²).
+//!
+//! Unitary updates and measurement use persistent column-packed storage. Other
+//! row algorithms lazily obtain a synchronized row view; mutable access
+//! invalidates the columns until the next gate. Read-only views do not force a repack.
 
 use crate::circuit::Gate;
+use crate::columns::Columns;
 use crate::error::{index_err, value_err, Error, Result};
 use crate::gf2::symplectic_completion;
 use crate::pauli::PauliString;
 use crate::rng::Rng;
 use crate::rows::Rows;
 use std::fmt;
+use std::sync::{Mutex, OnceLock};
 
 /// The outcome bit (true = |1⟩) and whether it was determinate (Case II).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,10 +30,34 @@ pub struct MeasureResult {
     pub deterministic: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Tableau {
     n: usize,
-    pub(crate) rows: Rows,
+    columns: Columns,
+    // Columns are authoritative unless a mutable row view was requested.
+    columns_current: bool,
+    rows: OnceLock<Rows>,
+    // A discarded read cache becomes the next conversion's destination.
+    // Locking occurs only when lazily constructing a view through &self;
+    // mutations use Mutex::get_mut, so the gate loop never locks.
+    spare_rows: Mutex<Option<Rows>>,
+}
+
+impl Clone for Tableau {
+    fn clone(&self) -> Self {
+        Self {
+            n: self.n,
+            columns: self.columns.clone(),
+            columns_current: self.columns_current,
+            // Copy authoritative rows only; derived read caches are disposable.
+            rows: if self.columns_current {
+                OnceLock::new()
+            } else {
+                OnceLock::from(self.rows.get().expect("current row view").clone())
+            },
+            spare_rows: Mutex::new(None),
+        }
+    }
 }
 
 impl Tableau {
@@ -38,12 +68,13 @@ impl Tableau {
     /// If `n == 0`.
     pub fn new(n: usize) -> Self {
         assert!(n >= 1, "a tableau needs at least one qubit");
-        let mut rows = Rows::new(n, 2 * n + 1);
-        for q in 0..n {
-            rows.set_x(q, q, true);
-            rows.set_z(n + q, q, true);
+        Tableau {
+            n,
+            columns: Columns::identity(n),
+            columns_current: true,
+            rows: OnceLock::new(),
+            spare_rows: Mutex::new(None),
         }
-        Tableau { n, rows }
     }
 
     /// A tableau whose stabilizer generators are exactly `stabs` (n
@@ -56,9 +87,10 @@ impl Tableau {
         }
         let (destabs, _, _) = symplectic_completion(n, stabs)?;
         let mut t = Tableau::new(n);
+        let rows = t.rows_mut();
         for i in 0..n {
-            t.rows.set_row_pauli(i, &destabs[i]);
-            t.rows.set_row_pauli(n + i, &stabs[i]);
+            rows.set_row_pauli(i, &destabs[i]);
+            rows.set_row_pauli(n + i, &stabs[i]);
         }
         Ok(t)
     }
@@ -68,15 +100,47 @@ impl Tableau {
     }
 
     pub fn num_words(&self) -> usize {
-        self.rows.w
+        crate::pauli::num_words(self.n)
     }
 
     pub(crate) fn rows(&self) -> &Rows {
-        &self.rows
+        self.rows.get_or_init(|| {
+            debug_assert!(self.columns_current);
+            let mut rows = self
+                .spare_rows
+                .lock()
+                .expect("row buffer lock")
+                .take()
+                .unwrap_or_else(|| Rows::new(self.n, 2 * self.n + 1));
+            self.columns.write_rows(&mut rows);
+            rows
+        })
     }
 
     pub(crate) fn rows_mut(&mut self) -> &mut Rows {
-        &mut self.rows
+        self.rows();
+        self.columns_current = false;
+        self.rows.get_mut().expect("current row view")
+    }
+
+    fn columns_mut(&mut self) -> &mut Columns {
+        if !self.columns_current {
+            self.columns
+                .load_rows(self.rows.get().expect("current row view"));
+            self.columns_current = true;
+        }
+        if let Some(rows) = self.rows.take() {
+            *self.spare_rows.get_mut().expect("row buffer lock") = Some(rows);
+        }
+        &mut self.columns
+    }
+
+    /// Circuit owns validated gates; unlike individual gate methods, this can
+    /// avoid repeated dispatch and validation without imposing a size threshold.
+    pub(crate) fn apply_unitaries(&mut self, gates: &[Gate]) {
+        if !gates.is_empty() {
+            self.columns_mut().apply(gates);
+        }
     }
 
     pub(crate) fn check_qubit(&self, q: usize) -> Result<()> {
@@ -100,44 +164,56 @@ impl Tableau {
     pub fn get_x(&self, row: usize, q: usize) -> Result<bool> {
         self.check_row(row)?;
         self.check_qubit(q)?;
-        Ok(self.rows.x(row, q))
+        Ok(if self.columns_current {
+            self.columns.x(row, q)
+        } else {
+            self.rows().x(row, q)
+        })
     }
 
     pub fn get_z(&self, row: usize, q: usize) -> Result<bool> {
         self.check_row(row)?;
         self.check_qubit(q)?;
-        Ok(self.rows.z(row, q))
+        Ok(if self.columns_current {
+            self.columns.z(row, q)
+        } else {
+            self.rows().z(row, q)
+        })
     }
 
     pub fn get_r(&self, row: usize) -> Result<bool> {
         self.check_row(row)?;
-        Ok(self.rows.r(row))
+        Ok(if self.columns_current {
+            self.columns.r(row)
+        } else {
+            self.rows().r(row)
+        })
     }
 
     pub fn set_x(&mut self, row: usize, q: usize, v: bool) -> Result<()> {
         self.check_row(row)?;
         self.check_qubit(q)?;
-        self.rows.set_x(row, q, v);
+        self.rows_mut().set_x(row, q, v);
         Ok(())
     }
 
     pub fn set_z(&mut self, row: usize, q: usize, v: bool) -> Result<()> {
         self.check_row(row)?;
         self.check_qubit(q)?;
-        self.rows.set_z(row, q, v);
+        self.rows_mut().set_z(row, q, v);
         Ok(())
     }
 
     pub fn set_r(&mut self, row: usize, v: bool) -> Result<()> {
         self.check_row(row)?;
-        self.rows.set_r(row, v);
+        self.rows_mut().set_r(row, v);
         Ok(())
     }
 
     /// Row as a signed Pauli.
     pub fn row(&self, row: usize) -> Result<PauliString> {
         self.check_row(row)?;
-        Ok(self.rows.row_pauli(row))
+        Ok(self.rows().row_pauli(row))
     }
 
     /// Overwrites a row. This can break the Proposition 3 invariants, so it is
@@ -154,18 +230,18 @@ impl Tableau {
         if !p.is_hermitian() {
             return value_err(format!("{p} has phase ±i, which a row cannot store"));
         }
-        self.rows.set_row_pauli(row, p);
+        self.rows_mut().set_row_pauli(row, p);
         Ok(())
     }
 
     pub fn destabilizers(&self) -> Vec<PauliString> {
-        (0..self.n).map(|i| self.rows.row_pauli(i)).collect()
+        let rows = self.rows();
+        (0..self.n).map(|i| rows.row_pauli(i)).collect()
     }
 
     pub fn stabilizers(&self) -> Vec<PauliString> {
-        (self.n..2 * self.n)
-            .map(|i| self.rows.row_pauli(i))
-            .collect()
+        let rows = self.rows();
+        (self.n..2 * self.n).map(|i| rows.row_pauli(i)).collect()
     }
 
     /// rowsum(h, i): row h ← row i · row h. Fails, leaving row h unchanged,
@@ -173,7 +249,7 @@ impl Tableau {
     pub fn rowsum(&mut self, h: usize, i: usize) -> Result<()> {
         self.check_row(h)?;
         self.check_row(i)?;
-        self.rows.rowsum(h, i).map_err(|s| {
+        self.rows_mut().rowsum(h, i).map_err(|s| {
             Error::Value(format!(
                 "rowsum({h}, {i}): phase sum {s} mod 4 is odd -- rows anticommute"
             ))
@@ -190,19 +266,19 @@ impl Tableau {
         if a == b {
             return value_err("CNOT control and target must differ");
         }
-        self.rows.cnot(a, b);
+        self.columns_mut().apply(&[Gate::Cnot(a, b)]);
         Ok(())
     }
 
     pub fn h(&mut self, a: usize) -> Result<()> {
         self.check_qubit(a)?;
-        self.rows.h(a);
+        self.columns_mut().apply(&[Gate::H(a)]);
         Ok(())
     }
 
     pub fn p(&mut self, a: usize) -> Result<()> {
         self.check_qubit(a)?;
-        self.rows.p(a);
+        self.columns_mut().apply(&[Gate::P(a)]);
         Ok(())
     }
 
@@ -230,7 +306,12 @@ impl Tableau {
 
     /// The first stabilizer row p with x_pa = 1, if any (Case I).
     fn random_pivot(&self, a: usize) -> Option<usize> {
-        (self.n..2 * self.n).find(|&p| self.rows.x(p, a))
+        if self.columns_current {
+            self.columns.random_pivot(self.n, a)
+        } else {
+            let rows = self.rows();
+            (self.n..2 * self.n).find(|&p| rows.x(p, a))
+        }
     }
 
     /// Whether measuring qubit `a` has a determinate outcome. O(n).
@@ -240,19 +321,26 @@ impl Tableau {
     }
 
     /// Case II: Z_a = ±∏ c_h R_{h+n} with c_h = x_ha, so sum those
-    /// stabilizers into the scratch row and read its sign.
+    /// stabilizers and read the product's sign. Only the row fallback uses the
+    /// scratch row; columns accumulate the phase with packed parity operations.
     fn determinate_outcome(&mut self, a: usize) -> Result<bool> {
+        if self.columns_current {
+            return self
+                .columns
+                .determinate_outcome(self.n, a)
+                .map_err(|_| broken_invariants());
+        }
         let n = self.n;
         let scratch = 2 * n;
-        self.rows.zero_row(scratch);
+        let rows = self.rows_mut();
+        rows.zero_row(scratch);
         for i in 0..n {
-            if self.rows.x(i, a) {
-                self.rows
-                    .rowsum(scratch, i + n)
+            if rows.x(i, a) {
+                rows.rowsum(scratch, i + n)
                     .map_err(|_| broken_invariants())?;
             }
         }
-        Ok(self.rows.r(scratch))
+        Ok(rows.r(scratch))
     }
 
     /// The outcome that measuring `a` would give, if it is determinate,
@@ -267,31 +355,45 @@ impl Tableau {
 
     fn measure_with(&mut self, a: usize, choose: impl FnOnce() -> bool) -> Result<MeasureResult> {
         self.check_qubit(a)?;
-        let n = self.n;
         match self.random_pivot(a) {
-            Some(p) => {
-                // Case I. Row p − n is overwritten below, so it is skipped:
-                // it anticommutes with row p and its product has phase ±i.
-                for i in 0..2 * n {
-                    if i != p && i != p - n && self.rows.x(i, a) {
-                        self.rows.rowsum(i, p).map_err(|_| broken_invariants())?;
-                    }
-                }
-                self.rows.copy_row(p - n, p);
-                self.rows.zero_row(p);
-                let outcome = choose();
-                self.rows.set_r(p, outcome);
-                self.rows.set_z(p, a, true);
-                Ok(MeasureResult {
-                    outcome,
-                    deterministic: false,
-                })
-            }
+            Some(p) => self.collapse_random(a, p, choose),
             None => Ok(MeasureResult {
                 outcome: self.determinate_outcome(a)?,
                 deterministic: true,
             }),
         }
+    }
+
+    fn collapse_random(
+        &mut self,
+        a: usize,
+        p: usize,
+        choose: impl FnOnce() -> bool,
+    ) -> Result<MeasureResult> {
+        let n = self.n;
+        let outcome = if self.columns_current {
+            self.columns_mut()
+                .measure_random(n, a, p, choose)
+                .map_err(|_| broken_invariants())?
+        } else {
+            let rows = self.rows_mut();
+            // The paired destabilizer is overwritten, so skip its ±i product.
+            for i in 0..2 * n {
+                if i != p && i != p - n && rows.x(i, a) {
+                    rows.rowsum(i, p).map_err(|_| broken_invariants())?;
+                }
+            }
+            rows.copy_row(p - n, p);
+            rows.zero_row(p);
+            let outcome = choose();
+            rows.set_r(p, outcome);
+            rows.set_z(p, a, true);
+            outcome
+        };
+        Ok(MeasureResult {
+            outcome,
+            deterministic: false,
+        })
     }
 
     /// Measures qubit `a` in the standard basis (Section III, Cases I and II).
@@ -303,15 +405,21 @@ impl Tableau {
     /// (post-selection). Fails, without changing the state, if the outcome
     /// is determinate and differs from `outcome`.
     pub fn measure_forced(&mut self, a: usize, outcome: bool) -> Result<MeasureResult> {
-        if let Some(det) = self.peek(a)? {
-            if det != outcome {
-                return value_err(format!(
-                    "qubit {a} is determinately {}, cannot force {}",
-                    det as u8, outcome as u8
-                ));
-            }
+        self.check_qubit(a)?;
+        if let Some(p) = self.random_pivot(a) {
+            return self.collapse_random(a, p, || outcome);
         }
-        self.measure_with(a, || outcome)
+        let det = self.determinate_outcome(a)?;
+        if det != outcome {
+            return value_err(format!(
+                "qubit {a} is determinately {}, cannot force {}",
+                det as u8, outcome as u8
+            ));
+        }
+        Ok(MeasureResult {
+            outcome: det,
+            deterministic: true,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -322,10 +430,11 @@ impl Tableau {
     /// exactly when they are a destabilizer/stabilizer pair (|i − j| = n).
     pub fn check_invariants(&self) -> Result<()> {
         let n = self.n;
+        let rows = self.rows();
         for i in 0..2 * n {
             for j in i + 1..2 * n {
                 let want = j == i + n;
-                if self.rows.anticommute(i, j) != want {
+                if rows.anticommute(i, j) != want {
                     return value_err(format!(
                         "rows {i} and {j} should {}",
                         if want { "anticommute" } else { "commute" }
@@ -395,7 +504,7 @@ impl PartialEq for Tableau {
     /// Rows 0..2n equal, signs included (the scratch row is ignored). By
     /// Lemma 5, two unitary circuits are equivalent iff their tableaus are.
     fn eq(&self, other: &Self) -> bool {
-        self.n == other.n && self.rows.rows_equal(&other.rows, 2 * self.n)
+        self.n == other.n && self.rows().rows_equal(other.rows(), 2 * self.n)
     }
 }
 
@@ -421,6 +530,227 @@ impl fmt::Display for Tableau {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn column_measurements_match_rows_without_materializing_a_view() {
+        // Dense entanglement, Y phases, both outcomes, repeated deterministic
+        // measurements, and non-aligned stabilizer halves/word boundaries.
+        for n in [1, 2, 31, 63, 64, 65, 127, 128, 129, 257] {
+            let mut packed = Tableau::new(n);
+            let mut scalar = Tableau::new(n);
+            scalar.rows_mut();
+            let mut random = Rng::seed_from_u64(921 + n as u64);
+            for _ in 0..20 * n {
+                let a = random.below(n);
+                match random.below(if n > 1 { 3 } else { 2 }) {
+                    0 => {
+                        packed.h(a).unwrap();
+                        scalar.rows_mut().h(a);
+                    }
+                    1 => {
+                        packed.p(a).unwrap();
+                        scalar.rows_mut().p(a);
+                    }
+                    _ => {
+                        let b = (a + 1 + random.below(n - 1)) % n;
+                        packed.cnot(a, b).unwrap();
+                        scalar.rows_mut().cnot(a, b);
+                    }
+                }
+            }
+            let mut actual = Rows::new(n, 2 * n + 1);
+            let mut a_rng = Rng::seed_from_u64(71);
+            let mut b_rng = a_rng.clone();
+            for step in 0..3 * n {
+                let q = step % n;
+                assert_eq!(
+                    packed.peek(q).unwrap(),
+                    scalar.peek(q).unwrap(),
+                    "n={n}, q={q}"
+                );
+                if step % 2 == 0 {
+                    assert_eq!(
+                        packed.measure(q, &mut a_rng).unwrap(),
+                        scalar.measure(q, &mut b_rng).unwrap()
+                    );
+                } else {
+                    let outcome = scalar.peek(q).unwrap().unwrap_or_else(|| random.bit());
+                    assert_eq!(
+                        packed.measure_forced(q, outcome).unwrap(),
+                        scalar.measure_forced(q, outcome).unwrap()
+                    );
+                }
+                let det = packed.peek(q).unwrap().unwrap();
+                assert!(packed.measure_forced(q, !det).is_err());
+                assert!(packed.columns_current);
+                assert!(
+                    packed.rows.get().is_none(),
+                    "measurement allocated a row view"
+                );
+                packed.columns.write_rows(&mut actual);
+                assert!(
+                    actual.rows_equal(scalar.rows(), 2 * n),
+                    "n={n}, step={step}"
+                );
+                // Re-entangle some measured qubits to exercise further random
+                // collapses after mutations, rather than only the first pass.
+                if step % 3 == 0 {
+                    packed.h(q).unwrap();
+                    scalar.rows_mut().h(q);
+                    packed.p(q).unwrap();
+                    scalar.rows_mut().p(q);
+                    if n > 1 {
+                        let b = (q + 1) % n;
+                        packed.cnot(q, b).unwrap();
+                        scalar.rows_mut().cnot(q, b);
+                    }
+                }
+            }
+            assert_eq!(a_rng.next_u64(), b_rng.next_u64());
+        }
+    }
+
+    #[test]
+    fn dense_deterministic_column_products_match_row_products() {
+        for n in [63, 64, 65, 129, 257] {
+            let mut packed = Tableau::new(n);
+            let mut scalar = Tableau::new(n);
+            let mut random = Rng::seed_from_u64(n as u64);
+            // Signed computational basis state, represented in a dense basis
+            // of Z stabilizers. Deterministic outcomes require products of many
+            // selected generators, including selections spanning word boundaries.
+            for q in 0..n {
+                if random.bit() {
+                    for gate in [Gate::H(q), Gate::P(q), Gate::P(q), Gate::H(q)] {
+                        packed.apply_unitary(&gate).unwrap();
+                        scalar.apply_unitary(&gate).unwrap();
+                    }
+                }
+            }
+            scalar.rows_mut();
+            for _ in 0..40 * n {
+                let a = random.below(n);
+                let b = (a + 1 + random.below(n - 1)) % n;
+                packed.cnot(a, b).unwrap();
+                scalar.rows_mut().cnot(a, b);
+            }
+            for q in 0..n {
+                assert_eq!(
+                    packed.peek(q).unwrap(),
+                    scalar.peek(q).unwrap(),
+                    "n={n}, q={q}"
+                );
+                assert!(packed.is_deterministic(q).unwrap());
+            }
+            assert!(packed.rows.get().is_none());
+        }
+    }
+
+    #[test]
+    fn row_views_are_lazy_and_conversion_buffers_are_reused() {
+        let mut t = Tableau::new(1025);
+        assert!(t.rows.get().is_none());
+        // A one-gate circuit on a large tableau must stay in column storage.
+        t.apply_unitaries(&[Gate::H(1024)]);
+        assert!(t.rows.get().is_none());
+        assert!(t.get_z(1024, 1024).unwrap());
+        assert!(t.get_x(1025 + 1024, 1024).unwrap());
+        assert!(t.rows.get().is_none());
+
+        let buffer = t.rows().x.as_ptr();
+        for _ in 0..10 {
+            t.h(0).unwrap();
+            assert!(t.columns_current);
+            assert!(t.rows.get().is_none());
+            assert_eq!(t.rows().x.as_ptr(), buffer);
+        }
+        t.set_r(0, true).unwrap();
+        assert!(!t.columns_current);
+        assert!(t.get_r(0).unwrap());
+        t.p(0).unwrap();
+        assert!(t.columns_current);
+        assert_eq!(t.rows().x.as_ptr(), buffer);
+        assert!(t.get_r(0).unwrap());
+    }
+
+    #[test]
+    fn persistent_storage_matches_row_algorithm_through_mutations() {
+        for n in [1, 2, 63, 64, 65, 129] {
+            let mut t = Tableau::new(n);
+            let mut scalar = Tableau::new(n);
+            scalar.rows_mut();
+            let mut random = Rng::seed_from_u64(n as u64);
+            let mut a_rng = Rng::seed_from_u64(17);
+            let mut b_rng = a_rng.clone();
+            for _ in 0..300 {
+                let a = random.below(n);
+                let b = (a + 1) % n;
+                match random.below(8) {
+                    0 => {
+                        t.h(a).unwrap();
+                        scalar.rows_mut().h(a);
+                    }
+                    1 => {
+                        t.p(a).unwrap();
+                        scalar.rows_mut().p(a);
+                    }
+                    2 if n > 1 => {
+                        t.cnot(a, b).unwrap();
+                        scalar.rows_mut().cnot(a, b);
+                    }
+                    3 => assert_eq!(
+                        t.measure(a, &mut a_rng).unwrap(),
+                        scalar.measure(a, &mut b_rng).unwrap()
+                    ),
+                    4 => assert_eq!(t.peek(a).unwrap(), scalar.peek(a).unwrap()),
+                    5 => {
+                        let row = t.row(a).unwrap();
+                        t.set_row(a, &row).unwrap();
+                    }
+                    6 if n > 1 => {
+                        // Change stabilizer basis and the paired destabilizers.
+                        t.rowsum(n + a, n + b).unwrap();
+                        t.rowsum(b, a).unwrap();
+                        scalar.rows_mut().rowsum(n + a, n + b).unwrap();
+                        scalar.rows_mut().rowsum(b, a).unwrap();
+                    }
+                    _ => {
+                        let mut copy = t.clone();
+                        assert_eq!(copy, scalar);
+                        copy.h(a).unwrap();
+                        copy.h(a).unwrap();
+                        assert_eq!(copy, scalar);
+                    }
+                }
+                assert_eq!(t, scalar, "n={n}");
+                assert_eq!(t.get_x(a, b).unwrap(), scalar.get_x(a, b).unwrap());
+                assert_eq!(t.get_z(a, b).unwrap(), scalar.get_z(a, b).unwrap());
+                assert_eq!(t.get_r(a).unwrap(), scalar.get_r(a).unwrap());
+                assert_eq!(
+                    t.is_deterministic(a).unwrap(),
+                    scalar.is_deterministic(a).unwrap()
+                );
+            }
+            t.check_invariants().unwrap();
+            assert_eq!(a_rng.next_u64(), b_rng.next_u64());
+        }
+    }
+
+    #[test]
+    fn concurrent_readers_share_a_synchronized_view() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Tableau>();
+        let mut t = Tableau::new(65);
+        t.h(64).unwrap();
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4).map(|_| scope.spawn(|| t.stabilizers())).collect();
+            for thread in threads {
+                let stabs = thread.join().unwrap();
+                assert_eq!(stabs[64], PauliString::single(65, 64, 'X').unwrap());
+            }
+        });
+        assert!(t.columns_current);
+    }
 
     #[test]
     fn identity_and_printer() {

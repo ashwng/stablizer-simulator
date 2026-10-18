@@ -172,15 +172,9 @@ impl Rows {
             let za = self.z[i * w + ka] & ma != 0;
             let xb = self.x[i * w + kb] & mb != 0;
             let zb = self.z[i * w + kb] & mb != 0;
-            if xa && zb && (xb == za) {
-                self.r[i] ^= 1;
-            }
-            if xa {
-                self.x[i * w + kb] ^= mb;
-            }
-            if zb {
-                self.z[i * w + ka] ^= ma;
-            }
+            self.r[i] ^= (xa & zb & !(xb ^ za)) as u8;
+            self.x[i * w + kb] ^= (0u64.wrapping_sub(xa as u64)) & mb;
+            self.z[i * w + ka] ^= (0u64.wrapping_sub(zb as u64)) & ma;
         }
     }
 
@@ -191,9 +185,7 @@ impl Rows {
         for i in 0..self.nrows {
             let xi = self.x[i * w + k];
             let zi = self.z[i * w + k];
-            if xi & zi & m != 0 {
-                self.r[i] ^= 1;
-            }
+            self.r[i] ^= ((xi & zi & m) != 0) as u8;
             self.x[i * w + k] = (xi & !m) | (zi & m);
             self.z[i * w + k] = (zi & !m) | (xi & m);
         }
@@ -206,9 +198,7 @@ impl Rows {
         for i in 0..self.nrows {
             let xa = self.x[i * w + k] & m;
             let za = self.z[i * w + k] & m;
-            if xa & za != 0 {
-                self.r[i] ^= 1;
-            }
+            self.r[i] ^= (xa & za != 0) as u8;
             self.z[i * w + k] ^= xa;
         }
     }

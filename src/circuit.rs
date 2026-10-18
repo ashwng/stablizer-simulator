@@ -158,9 +158,7 @@ impl Circuit {
             return value_err("tableau() needs a unitary circuit");
         }
         let mut t = Tableau::new(self.n.max(1));
-        for g in &self.gates {
-            t.apply_unitary(g)?;
-        }
+        self.run(&mut t, &mut Rng::seed_from_u64(0))?;
         Ok(t)
     }
 
@@ -174,9 +172,16 @@ impl Circuit {
             ));
         }
         let mut out = Vec::new();
-        for g in &self.gates {
-            if let Some(r) = tab.apply(g, rng)? {
-                out.push((g.qubits()[0], r));
+        let mut remaining = self.gates.as_slice();
+        while !remaining.is_empty() {
+            let unitary_len = remaining.iter().take_while(|g| g.is_unitary()).count();
+            let (unitaries, rest) = remaining.split_at(unitary_len);
+            tab.apply_unitaries(unitaries);
+            if let Some((&Gate::Measure(q), rest)) = rest.split_first() {
+                out.push((q, tab.measure(q, rng)?));
+                remaining = rest;
+            } else {
+                break;
             }
         }
         Ok(out)
@@ -196,5 +201,73 @@ impl Circuit {
 impl fmt::Display for Circuit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_chp())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn random_gate(n: usize, rng: &mut Rng) -> Gate {
+        let a = rng.below(n);
+        match rng.below(if n > 1 { 3 } else { 2 }) {
+            0 => Gate::H(a),
+            1 => Gate::P(a),
+            _ => Gate::Cnot(a, (a + 1 + rng.below(n - 1)) % n),
+        }
+    }
+
+    #[test]
+    fn batches_preserve_measurement_results_and_full_tableau() {
+        for n in [1, 2, 31, 32, 63, 64, 65, 127, 128, 129] {
+            for idle in [0, 3] {
+                let mut random = Rng::seed_from_u64(n as u64);
+                let mut circuit = Circuit::new(n);
+                // Leading, adjacent, and trailing measurements; runs on both
+                // sides of the batch threshold, with larger destination states.
+                for len in [0, 63, 64, 65, 257, 1, 0] {
+                    for _ in 0..len {
+                        circuit.push(random_gate(n, &mut random)).unwrap();
+                    }
+                    circuit.measure(random.below(n)).unwrap();
+                }
+                let mut scalar = Tableau::new(n + idle);
+                for _ in 0..4 * (n + idle) {
+                    scalar
+                        .apply_unitary(&random_gate(n + idle, &mut random))
+                        .unwrap();
+                }
+                let mut batched = scalar.clone();
+                let mut scalar_rng = Rng::seed_from_u64(123);
+                let mut batch_rng = scalar_rng.clone();
+                let mut expected = Vec::new();
+                for gate in circuit.gates() {
+                    if let Some(result) = scalar.apply(gate, &mut scalar_rng).unwrap() {
+                        expected.push((gate.qubits()[0], result));
+                    }
+                }
+                let actual = circuit.run(&mut batched, &mut batch_rng).unwrap();
+                assert_eq!(actual, expected, "n={n}, idle={idle}");
+                assert_eq!(batched, scalar, "n={n}, idle={idle}");
+                assert_eq!(batch_rng.next_u64(), scalar_rng.next_u64());
+                batched.check_invariants().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn long_unitary_tableau_matches_scalar_and_rejects_small_destination() {
+        let mut random = Rng::seed_from_u64(7);
+        let mut circuit = Circuit::new(65);
+        let mut expected = Tableau::new(65);
+        for _ in 0..400 {
+            let gate = random_gate(65, &mut random);
+            circuit.push(gate).unwrap();
+            expected.apply_unitary(&gate).unwrap();
+        }
+        assert_eq!(circuit.tableau().unwrap(), expected);
+        let mut small = Tableau::new(64);
+        assert!(circuit.run(&mut small, &mut random).is_err());
+        assert_eq!(small, Tableau::new(64));
     }
 }

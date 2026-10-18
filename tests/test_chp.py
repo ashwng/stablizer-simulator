@@ -1,8 +1,10 @@
 """Section IV: the CHP language and the example programs the paper mentions."""
 
 import pathlib
+import os
 import random
 import subprocess
+import sys
 
 import pytest
 
@@ -99,9 +101,9 @@ def test_run_returns_final_tableau():
 
 
 def test_cli(tmp_path):
-    exe = pathlib.Path(__file__).resolve().parent.parent / "target" / "release" / "chp.exe"
-    if not exe.exists():
-        exe = exe.with_suffix("")
+    default_target = pathlib.Path(__file__).resolve().parent.parent / "target"
+    target = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", default_target))
+    exe = target / "release" / ("chp.exe" if sys.platform == "win32" else "chp")
     if not exe.exists():
         pytest.skip("chp binary not built (cargo build --release)")
     out = subprocess.run(
